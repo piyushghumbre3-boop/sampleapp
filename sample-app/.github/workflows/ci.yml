@@ -1,0 +1,92 @@
+name: CI - Build and Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'app/**'
+
+permissions:
+  id-token: write   # for OIDC auth to AWS
+  contents: write   # to commit updated manifest back
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: sample-app
+  EKS_NAMESPACE: default
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.vars.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: vars
+        run: echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::007427784670:role/github-actions-ecr-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2.1.6
+
+      - name: Build image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG ./app
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: '${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.vars.outputs.tag }}'
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'          # fail the build if fixable CRITICAL/HIGH CVEs are found
+          ignore-unfixed: true    # don't fail on CVEs with no available fix yet
+
+      - name: Push image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+  update-manifest:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Kustomize
+        run: |
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/
+
+      - name: Update image tag
+        run: |
+          cd manifests/overlays/prod
+          kustomize edit set image 007427784670.dkr.ecr.us-east-1.amazonaws.com/sample-app=007427784670.dkr.ecr.us-east-1.amazonaws.com/sample-app:${{ needs.build-and-push.outputs.image_tag }}
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add manifests/overlays/prod/kustomization.yaml
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "ci: update image to ${{ needs.build-and-push.outputs.image_tag }}"
+          git push
